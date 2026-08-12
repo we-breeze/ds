@@ -1,5 +1,5 @@
 use crate::RingSlice;
-use procs::impl_number_ringslice;
+use ds_macros::impl_number_ringslice;
 // 如果方法名中没有包含be或者le，则默认为be
 #[impl_number_ringslice(default = "be")]
 pub trait ByteOrder {

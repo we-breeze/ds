@@ -7,7 +7,7 @@ edition = "2024"
 
 [dependencies]
 log = { path = "../log" }
-procs = { path = "../procs" }
+ds-macros = { path = "macros" }
 minstant = "*"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 
