@@ -10,10 +10,8 @@ pub struct CowReadHandle<T> {
 
 impl<T> Clone for CowReadHandle<T> {
     fn clone(&self) -> Self {
-        match self {
-            CowReadHandle { inner } => CowReadHandle {
-                inner: inner.clone(),
-            },
+        Self {
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -47,6 +45,7 @@ impl<T> From<T> for CowReadHandle<T> {
 /// - 并发更新会以最后更新的为准，但是没验证过
 /// - Cow通过AtomicPtr实现，每次更新T，都会在堆上创建一个Arc<T>，阻塞等到没有读后drop旧Arc<T>
 /// - 读取会获取一个对当前堆上Arc<T>的一个clone，否则我们drop后，T将会失效
+///
 /// 也就是多个线程获取的T是同一个T，行为本质上和多个线程操作Arc<T>没有区别，不是线程安全的
 /// 所以只有T本身是sync+send的时候，我们才是sync+send的，PhantomData保证了这一点
 pub(crate) struct CowHandleInner<T> {
