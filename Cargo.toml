@@ -3,27 +3,16 @@ name = "ds"
 version = "0.1.0"
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-log = "0.4"
-ds-macros = { path = "macros" }
-minstant = "*"
-tokio = { version = "1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
-
-byteorder = "1.4.3"
-rand = "0.8.5"
-atomic-waker = "*"
 mimalloc = { version = "0.1.34", default-features = false }
-ctor = "*"
 crossbeam-utils = "*"
-rsa = "0.9"
 
-bytes = "1.0"
-paste = "*"
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [features]
 default = ["heap-stats"]
 heap-stats = []
-tsc = []
-trace = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
