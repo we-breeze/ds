@@ -127,7 +127,7 @@ impl ArenaInner {
 
 #[repr(align(64))]
 struct Chunk {
-    data: Box<[UnsafeCell<u8>]>,
+    data: Box<[UnsafeCell<MaybeUninit<u8>>]>,
     state: ChunkState,
 }
 
@@ -141,10 +141,14 @@ struct ChunkState {
 
 impl Chunk {
     fn new(capacity: usize) -> Self {
-        let data = (0..capacity)
-            .map(|_| UnsafeCell::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // The bump allocator initializes every issued byte range before it is
+        // exposed. Reserving uninitialized backing avoids touching both large
+        // chunks during process startup.
+        let data = Box::<[UnsafeCell<MaybeUninit<u8>>]>::new_uninit_slice(capacity);
+        // SAFETY: `UnsafeCell<MaybeUninit<u8>>` has no initialized-byte
+        // requirement. Converting the outer `MaybeUninit` slice is therefore
+        // valid without touching any backing pages.
+        let data = unsafe { data.assume_init() };
         Self {
             data,
             state: ChunkState::new(capacity),
@@ -158,7 +162,10 @@ impl Chunk {
 
     #[inline]
     fn data_ptr(&self) -> *mut u8 {
-        self.data.as_ptr().cast::<u8>().cast_mut()
+        // Each byte retains its own interior-mutability boundary. This obtains
+        // a raw pointer without constructing an exclusive borrow of the whole
+        // backing slice; disjoint ranges are enforced by the bump cursor.
+        UnsafeCell::raw_get(self.data.as_ptr()).cast::<u8>()
     }
 }
 
