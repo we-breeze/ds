@@ -10,11 +10,11 @@ The crate intentionally keeps a small surface:
 
 ## Ephemeral bytes
 
-Frames up to 48 bytes are stored inline and do not touch the shared arena or its
-atomic state. Larger frames use two fixed-size bump chunks. A chunk is frozen
-after a request no longer fits, and becomes reusable as a whole once every frame
-issued from it has been dropped. Release order does not matter. If neither chunk
-can serve a request, allocation falls back to the heap without waiting.
+The arena owns one backing buffer divided into two fixed-size bump chunks. Each
+frame reserves exactly its requested capacity. A chunk is frozen after a
+request no longer fits, and becomes reusable as a whole once every frame issued
+from it has been dropped. Release order does not matter. If neither chunk can
+serve a request, allocation falls back to the heap without waiting.
 
 This crate provides the allocation mechanism only. The process-wide request
 arena and its startup policy are owned by the `net` crate so Redis, MC, and
