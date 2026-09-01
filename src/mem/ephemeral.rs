@@ -13,21 +13,19 @@ use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 
 const CHUNK_COUNT: usize = 2;
-/// Frames up to this size are stored directly in the frame value.
-pub const EPHEMERAL_BYTES_INLINE_CAPACITY: usize = 48;
 const FROZEN: u64 = 1 << 63;
 const OFFSET_MASK: u64 = FROZEN - 1;
 const ALLOCATED_ONE: u64 = 1 << 32;
 
 /// A shared allocator for short-lived encoded byte frames.
 ///
-/// Frames of [`EPHEMERAL_BYTES_INLINE_CAPACITY`] bytes or less stay inline. For
-/// larger frames, the arena owns two fixed-size bump-allocation chunks. An
-/// allocation that no longer fits freezes the current chunk and switches to the
-/// other one. A frozen chunk is reset as a whole after all allocations issued
-/// from it have been dropped. Allocation never waits: oversized frames, or
-/// frames for which neither chunk is available, fall back to a private heap
-/// buffer.
+/// The arena owns one backing buffer divided into two fixed-size bump-allocation
+/// chunks. An allocation reserves exactly the requested capacity. When it no
+/// longer fits, the current chunk is frozen and allocation switches to the
+/// other chunk. A frozen chunk is reset as a whole after every allocation
+/// ticket issued from it has been dropped. Allocation never waits: oversized
+/// frames, or frames for which neither chunk is available, fall back to a
+/// private heap buffer.
 #[derive(Clone)]
 pub struct EphemeralBytesArena {
     inner: Arc<ArenaInner>,
@@ -48,8 +46,12 @@ impl EphemeralBytesArena {
 
         Self {
             inner: Arc::new(ArenaInner {
+                data: new_backing_buffer(chunk_capacity),
                 current: AtomicUsize::new(0),
-                chunks: std::array::from_fn(|_| Chunk::new(chunk_capacity)),
+                chunks: [
+                    Chunk::new(0, chunk_capacity),
+                    Chunk::new(chunk_capacity, chunk_capacity),
+                ],
             }),
         }
     }
@@ -57,14 +59,11 @@ impl EphemeralBytesArena {
     /// Reserves space for one frame.
     ///
     /// The returned buffer starts empty and can grow up to `capacity` without
-    /// another allocation. Small frames stay inline; dropping an arena-backed
-    /// frame before or after [`EphemeralBytesMut::freeze`] returns its chunk
-    /// allocation automatically.
+    /// another allocation. Dropping an arena-backed frame before or after
+    /// [`EphemeralBytesMut::freeze`] releases its chunk ticket automatically.
     #[inline]
     pub fn alloc(&self, capacity: usize) -> EphemeralBytesMut {
-        let storage = if capacity <= EPHEMERAL_BYTES_INLINE_CAPACITY {
-            Storage::Inline([MaybeUninit::uninit(); EPHEMERAL_BYTES_INLINE_CAPACITY])
-        } else if capacity > self.chunk_capacity() {
+        let storage = if capacity == 0 || capacity > self.chunk_capacity() {
             Storage::Heap(Vec::with_capacity(capacity))
         } else if let Some(allocation) = self.inner.reserve(capacity) {
             Storage::Arena(allocation)
@@ -103,6 +102,7 @@ impl Debug for EphemeralBytesArena {
 }
 
 struct ArenaInner {
+    data: Box<[UnsafeCell<MaybeUninit<u8>>]>,
     current: AtomicUsize,
     chunks: [Chunk; CHUNK_COUNT],
 }
@@ -123,11 +123,19 @@ impl ArenaInner {
             .reserve(len)
             .map(|offset| ArenaAllocation::new(Arc::clone(self), second, offset, len))
     }
+
+    #[inline]
+    fn data_ptr(&self) -> *mut u8 {
+        // The bump cursors give every live allocation a disjoint range. This
+        // obtains a raw pointer without creating an exclusive borrow of the
+        // complete backing buffer.
+        UnsafeCell::raw_get(self.data.as_ptr()).cast::<u8>()
+    }
 }
 
 #[repr(align(64))]
 struct Chunk {
-    data: Box<[UnsafeCell<MaybeUninit<u8>>]>,
+    base: usize,
     state: ChunkState,
 }
 
@@ -140,17 +148,9 @@ struct ChunkState {
 }
 
 impl Chunk {
-    fn new(capacity: usize) -> Self {
-        // The bump allocator initializes every issued byte range before it is
-        // exposed. Reserving uninitialized backing avoids touching both large
-        // chunks during process startup.
-        let data = Box::<[UnsafeCell<MaybeUninit<u8>>]>::new_uninit_slice(capacity);
-        // SAFETY: `UnsafeCell<MaybeUninit<u8>>` has no initialized-byte
-        // requirement. Converting the outer `MaybeUninit` slice is therefore
-        // valid without touching any backing pages.
-        let data = unsafe { data.assume_init() };
+    fn new(base: usize, capacity: usize) -> Self {
         Self {
-            data,
+            base,
             state: ChunkState::new(capacity),
         }
     }
@@ -159,14 +159,20 @@ impl Chunk {
     fn reserve(&self, len: usize) -> Option<usize> {
         self.state.reserve(len)
     }
+}
 
-    #[inline]
-    fn data_ptr(&self) -> *mut u8 {
-        // Each byte retains its own interior-mutability boundary. This obtains
-        // a raw pointer without constructing an exclusive borrow of the whole
-        // backing slice; disjoint ranges are enforced by the bump cursor.
-        UnsafeCell::raw_get(self.data.as_ptr()).cast::<u8>()
-    }
+fn new_backing_buffer(chunk_capacity: usize) -> Box<[UnsafeCell<MaybeUninit<u8>>]> {
+    let capacity = chunk_capacity
+        .checked_mul(CHUNK_COUNT)
+        .expect("ephemeral arena backing capacity overflow");
+    // The bump allocator initializes every issued byte range before exposing
+    // it. Reserving uninitialized backing avoids touching the arena pages at
+    // process startup.
+    let data = Box::<[UnsafeCell<MaybeUninit<u8>>]>::new_uninit_slice(capacity);
+    // SAFETY: `UnsafeCell<MaybeUninit<u8>>` has no initialized-byte
+    // requirement, so the outer slice may be assumed initialized without
+    // touching its backing pages.
+    unsafe { data.assume_init() }
 }
 
 impl ChunkState {
@@ -293,10 +299,10 @@ impl ChunkState {
     }
 }
 
-// SAFETY: the bump cursor gives every live allocation a disjoint byte range.
-// A chunk is reset only after every ticket has been released, so raw accesses
-// through one allocation never overlap a concurrently live allocation.
-unsafe impl Sync for Chunk {}
+// SAFETY: each chunk's bump cursor gives every live allocation a disjoint byte
+// range in `data`. A chunk is reset only after every ticket has been released,
+// so raw accesses through one allocation never overlap another live range.
+unsafe impl Sync for ArenaInner {}
 
 struct ArenaAllocation {
     arena: Arc<ArenaInner>,
@@ -319,7 +325,8 @@ impl ArenaAllocation {
     fn as_mut_ptr(&self) -> *mut u8 {
         // SAFETY: `offset` is returned by this chunk's bounded cursor and the
         // allocation owns the following `capacity` bytes until Drop.
-        unsafe { self.arena.chunks[self.chunk].data_ptr().add(self.offset) }
+        let chunk = &self.arena.chunks[self.chunk];
+        unsafe { self.arena.data_ptr().add(chunk.base + self.offset) }
     }
 }
 
@@ -331,7 +338,6 @@ impl Drop for ArenaAllocation {
 }
 
 enum Storage {
-    Inline([MaybeUninit<u8>; EPHEMERAL_BYTES_INLINE_CAPACITY]),
     Arena(ArenaAllocation),
     Heap(Vec<u8>),
 }
@@ -340,7 +346,6 @@ impl Storage {
     #[inline]
     fn capacity(&self) -> usize {
         match self {
-            Self::Inline(_) => EPHEMERAL_BYTES_INLINE_CAPACITY,
             Self::Arena(allocation) => allocation.capacity,
             Self::Heap(bytes) => bytes.capacity(),
         }
@@ -352,19 +357,8 @@ impl Storage {
     }
 
     #[inline]
-    fn is_inline(&self) -> bool {
-        matches!(self, Self::Inline(_))
-    }
-
-    #[inline]
     fn as_slice(&self, len: usize) -> &[u8] {
         match self {
-            Self::Inline(bytes) => {
-                // SAFETY: only the initialized prefix, tracked by `len`, is
-                // exposed. `extend_from_slice` initializes it before `len`
-                // advances.
-                unsafe { slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), len) }
-            }
             Self::Arena(allocation) => {
                 // SAFETY: the allocation remains live for the returned borrow,
                 // and `len` never exceeds its reserved range.
@@ -377,18 +371,6 @@ impl Storage {
     #[inline]
     fn extend_from_slice(&mut self, offset: usize, bytes: &[u8]) {
         match self {
-            Self::Inline(output) => {
-                // SAFETY: the caller checked the write against the inline
-                // capacity. The written prefix is marked live by advancing
-                // the frame length immediately after this call.
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        output.as_mut_ptr().cast::<u8>().add(offset),
-                        bytes.len(),
-                    );
-                }
-            }
             Self::Arena(allocation) => {
                 // SAFETY: `offset + bytes.len()` was checked against the unique
                 // allocation's capacity by the caller.
@@ -444,12 +426,6 @@ impl EphemeralBytesMut {
         self.storage().is_heap()
     }
 
-    /// Whether the bytes are stored directly in this frame value.
-    #[inline]
-    pub fn is_inline(&self) -> bool {
-        self.storage().is_inline()
-    }
-
     /// Appends bytes without performing another allocation.
     ///
     /// Panics if the originally reserved capacity is insufficient.
@@ -464,6 +440,16 @@ impl EphemeralBytesMut {
         let offset = self.len;
         self.storage_mut().extend_from_slice(offset, bytes);
         self.len += bytes.len();
+    }
+
+    /// Shortens the initialized prefix while retaining the reserved capacity.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        let len = self.len.min(len);
+        self.len = len;
+        if let Storage::Heap(bytes) = self.storage_mut() {
+            bytes.truncate(len);
+        }
     }
 
     /// Converts the writable frame into immutable bytes without copying.
@@ -523,8 +509,7 @@ impl Debug for EphemeralBytesMut {
     }
 }
 
-/// Immutable, move-only bytes backed by inline storage, an arena allocation, or
-/// a heap fallback.
+/// Immutable, move-only bytes backed by an arena allocation or heap fallback.
 ///
 /// Dropping the value releases its allocation ticket. The underlying chunk is
 /// reused only after every value issued from the frozen chunk has been dropped.
@@ -547,12 +532,6 @@ impl EphemeralBytes {
     #[inline]
     pub fn is_heap_allocated(&self) -> bool {
         self.storage.is_heap()
-    }
-
-    /// Whether the bytes are stored directly in this frame value.
-    #[inline]
-    pub fn is_inline(&self) -> bool {
-        self.storage.is_inline()
     }
 
     #[inline]
@@ -596,35 +575,44 @@ mod tests {
 
     fn chunk_index(bytes: &EphemeralBytesMut) -> Option<usize> {
         match bytes.storage() {
-            Storage::Inline(_) => None,
             Storage::Arena(allocation) => Some(allocation.chunk),
             Storage::Heap(_) => None,
         }
     }
 
     #[test]
-    fn small_frames_use_all_48_inline_bytes_without_touching_the_arena() {
+    fn small_frames_reserve_the_exact_requested_arena_capacity() {
         let arena = EphemeralBytesArena::new(64);
-        let before = arena.inner.chunks[0].state.snapshot();
-        let mut bytes = arena.alloc(EPHEMERAL_BYTES_INLINE_CAPACITY);
+        let mut bytes = arena.alloc(13);
 
-        assert!(bytes.is_inline());
-        assert_eq!(bytes.capacity(), EPHEMERAL_BYTES_INLINE_CAPACITY);
-        bytes.extend_from_slice(&[0x5a; EPHEMERAL_BYTES_INLINE_CAPACITY]);
+        assert_eq!(chunk_index(&bytes), Some(0));
+        assert_eq!(bytes.capacity(), 13);
+        bytes.extend_from_slice(&[0x5a; 13]);
         let bytes = bytes.freeze();
 
-        assert!(bytes.is_inline());
-        assert_eq!(bytes.len(), EPHEMERAL_BYTES_INLINE_CAPACITY);
+        assert_eq!(bytes.len(), 13);
         assert!(bytes.iter().all(|byte| *byte == 0x5a));
-        assert_eq!(arena.inner.chunks[0].state.snapshot(), before);
     }
 
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn inline_storage_has_the_expected_64_bit_layout() {
-        assert_eq!(std::mem::size_of::<Storage>(), 56);
-        assert_eq!(std::mem::size_of::<EphemeralBytesMut>(), 64);
-        assert_eq!(std::mem::size_of::<EphemeralBytes>(), 64);
+    fn frame_layout_does_not_embed_a_line_buffer() {
+        assert!(std::mem::size_of::<EphemeralBytesMut>() <= 48);
+        assert!(std::mem::size_of::<EphemeralBytes>() <= 48);
+    }
+
+    #[test]
+    fn both_chunks_share_one_backing_buffer() {
+        let arena = EphemeralBytesArena::new(64);
+        let first = arena.alloc(64);
+        let second = arena.alloc(64);
+
+        assert_eq!(chunk_index(&first), Some(0));
+        assert_eq!(chunk_index(&second), Some(1));
+        let base = arena.inner.data_ptr() as usize;
+        let end = base + arena.inner.data.len();
+        assert!((base..end).contains(&(first.as_slice().as_ptr() as usize)));
+        assert!((base..end).contains(&(second.as_slice().as_ptr() as usize)));
     }
 
     #[test]
@@ -675,10 +663,10 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frames_use_heap_and_empty_frames_stay_inline() {
+    fn oversized_and_empty_frames_use_the_non_blocking_heap_fallback() {
         let arena = EphemeralBytesArena::new(64);
         assert!(arena.alloc(65).is_heap_allocated());
-        assert!(arena.alloc(0).is_inline());
+        assert!(arena.alloc(0).is_heap_allocated());
     }
 
     #[test]
@@ -697,8 +685,7 @@ mod tests {
                     let marker = worker as u8 + 1;
                     let mut live = Vec::with_capacity(16);
                     for round in 0..ROUNDS {
-                        let len =
-                            EPHEMERAL_BYTES_INLINE_CAPACITY + 1 + (round * 17 + worker * 13) % 48;
+                        let len = 1 + (round * 17 + worker * 13) % 96;
                         let mut bytes = arena.alloc(len);
                         bytes.extend_from_slice(&vec![marker; len]);
                         live.push(bytes.freeze());
@@ -729,8 +716,8 @@ mod tests {
     #[should_panic(expected = "ephemeral byte capacity exceeded")]
     fn cannot_grow_past_reserved_capacity() {
         let arena = EphemeralBytesArena::new(64);
-        let mut bytes = arena.alloc(EPHEMERAL_BYTES_INLINE_CAPACITY);
-        bytes.extend_from_slice(&[0; EPHEMERAL_BYTES_INLINE_CAPACITY + 1]);
+        let mut bytes = arena.alloc(8);
+        bytes.extend_from_slice(&[0; 9]);
     }
 }
 
