@@ -4,7 +4,6 @@ Shared low-level data structures used by Breeze components.
 
 The crate intentionally keeps a small surface:
 
-- `Cow`, `CowReadHandle`, and `CowWriteHandle` for single-writer copy-on-write publication;
 - `BrzMalloc` and `heap()` for the existing mimalloc-backed heap accounting;
 - `EphemeralBytesArena` for short-lived encoded request frames.
 
