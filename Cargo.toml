@@ -1,11 +1,18 @@
 [package]
-name = "ds"
+name = "brz-ds"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shared low-level data structures used by Breeze components"
+repository = "https://github.com/we-breeze/ds"
+readme = "README.md"
+
+[lib]
+name = "ds"
 
 [dependencies]
 mimalloc = { version = "0.1.34", default-features = false }
-crossbeam-utils = "*"
+crossbeam-utils = "0.8"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
