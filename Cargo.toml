@@ -8,7 +8,7 @@ repository = "https://github.com/we-breeze/ds"
 readme = "README.md"
 
 [lib]
-name = "ds"
+name = "brz_ds"
 
 [dependencies]
 mimalloc = { version = "0.1.34", default-features = false }

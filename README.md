@@ -20,7 +20,7 @@ arena and its startup policy are owned by the `net` crate so Redis, MC, and
 Motan can share one instance.
 
 ```rust
-use ds::EphemeralBytesArena;
+use brz_ds::EphemeralBytesArena;
 
 let arena = EphemeralBytesArena::new(4 * 1024 * 1024);
 let mut frame = arena.alloc(9);
@@ -50,7 +50,7 @@ The crates.io package is `brz-ds`; the Rust library name remains `ds`:
 
 ```toml
 [dependencies]
-ds = { package = "brz-ds", version = "0.0.2" }
+brz-ds = "0.0.3"
 ```
 
 This version becomes available after the first successful Publish run.
@@ -102,3 +102,14 @@ runs the same checks itself.
 
 Licensed under either the MIT license or the Apache License, Version 2.0,
 at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+## Crate naming
+
+The package name is `brz-ds`; the Rust library name is `brz_ds`.
+Use `brz_ds::...` in Rust code. This replaces the previous `ds`
+library name. Existing explicit dependency aliases remain supported.
+
+```toml
+[dependencies]
+brz-ds = "0.0.3"
+```
