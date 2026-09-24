@@ -5,7 +5,8 @@ Shared low-level data structures used by Breeze components.
 The crate intentionally keeps a small surface:
 
 - `BrzMalloc` and `heap()` for the existing mimalloc-backed heap accounting;
-- `EphemeralBytesArena` for short-lived encoded request frames.
+- `EphemeralBytesArena` for short-lived encoded request frames;
+- `SmolStr` for strings that stay inline while they fit and spill past that.
 
 ## Ephemeral bytes
 
@@ -29,6 +30,33 @@ let frame = frame.freeze();
 
 assert_eq!(frame.as_ref(), b"GET key\r\n");
 ```
+
+## Smol strings
+
+`SmolStr` is a single concrete type, one 64-byte cache line wide: 62 content
+bytes, one length byte, and the discriminant. Nothing is truncated, and writes
+never fail, so a field that must be bounded bounds itself before storing. A
+value read out of a reusable buffer can be kept because the inline arm copies
+rather than borrows.
+
+Equality, ordering, and hashing compare the text and not the representation, so
+the same content compares and hashes identically in both arms and a
+`HashMap<SmolStr, _>` can be read with a `&str` key.
+
+```rust
+use brz_ds::SmolStr;
+
+let mut value = SmolStr::from("/api/items?q=a");
+assert!(!value.is_heap_allocated());
+
+value.push_str("&page=2");
+assert_eq!(value, "/api/items?q=a&page=2");
+assert_eq!(value.len(), 21);
+```
+
+`size_of::<SmolStr>()` is 64 bytes, asserted at compile time, so a compiler
+release that changes the representation fails the build instead of silently
+widening every frame that embeds the value.
 
 ## Verification
 
