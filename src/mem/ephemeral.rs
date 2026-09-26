@@ -1,3 +1,6 @@
+#[cfg(feature = "tokio")]
+mod receive;
+
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Formatter};
 use std::io;
