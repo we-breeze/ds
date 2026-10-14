@@ -78,7 +78,7 @@ The crates.io package is `brz-ds`; the Rust library name remains `ds`:
 
 ```toml
 [dependencies]
-brz-ds = "0.0.3"
+brz-ds = "0.0.6"
 ```
 
 This version becomes available after the first successful Publish run.
@@ -139,5 +139,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-ds = "0.0.3"
+brz-ds = "0.0.6"
 ```
